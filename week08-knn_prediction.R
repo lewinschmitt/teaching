@@ -122,6 +122,8 @@ results1 %>%
 
 # What would be our best k based on LOOCV?
 max(results1$accuracy.loocv)
+results1 %>%
+  filter(accuracy.loocv == max(accuracy.loocv))
 
 # Note: the class() package with which we implemented this knn also has functions for CV:
 # check out the documentation for knn1() and knn.cv() to learn more about it.
