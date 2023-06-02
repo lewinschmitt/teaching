@@ -1,0 +1,153 @@
+### Script prepared by Lewin Schmitt for IBEI's MLSS course (2023)
+### Based on Julia Silge's "Multiclass predictive modeling for #TidyTuesday NBER papers 
+### https://juliasilge.com/blog/nber-papers/
+
+## INTRODUCTION ----
+# In this script, we'll recap how to build, tune, and evaluate a multiclass predictive model with text features and lasso regularization
+# We use the tidymodels family (https://www.tidymodels.org/) and introduce recipes() and workflow(), handy tools to make the ML pipeline in R more user-friendly.
+# Our dataset contains NBER working papers.
+
+# Our modeling goal is to predict the category of National Bureau of Economic Research working papers from the titles and years of the papers.
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, tidytext, tidylo, tidymodels, themis, textrecipes)
+
+# Let's download the data
+papers <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-28/papers.csv")
+programs <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-28/programs.csv")
+paper_authors <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-28/paper_authors.csv")
+paper_programs <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-28/paper_programs.csv")
+
+# Next, we combine and prepare a unified dataset with the following variables:
+# paper (unique id)
+# program_category (the categorical variable of interest)
+# year - publication year
+# title - title of the paper
+
+papers_joined <-
+  paper_programs %>%
+  left_join(programs) %>%
+  left_join(papers) %>%
+  filter(!is.na(program_category)) %>%
+  distinct(paper, program_category, year, title)
+
+# How are papers distributed across the different categories?
+papers_joined %>%
+  count(program_category)
+
+# Since we have more than two classes, we need to train a multiclass predictive model, not a simpler binary classification model.
+
+# Before moving on, let's have a quick look into word frequencies by topic:
+
+title_log_odds <-
+  papers_joined %>%
+  unnest_tokens(word, title) %>%
+  filter(!is.na(program_category)) %>%
+  count(program_category, word, sort = TRUE) %>%
+  bind_log_odds(program_category, word, n)
+
+title_log_odds %>%
+  group_by(program_category) %>%
+  slice_max(log_odds_weighted, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(log_odds_weighted,
+             fct_reorder(word, log_odds_weighted),
+             fill = program_category
+  )) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(vars(program_category), scales = "free_y") +
+  labs(x = "Log odds (weighted)", y = NULL)
+
+# The relationship between words and categories is what we want to use for our model.
+# Input/IVs: individual words, publication year
+# Output/DV: category
+
+## Build and tune a model ----
+
+# Prepare our data splits
+set.seed(123)
+nber_split <- initial_split(papers_joined, strata = program_category)
+nber_train <- training(nber_split)
+nber_test <- testing(nber_split)
+
+nber_folds <- vfold_cv(nber_train, strata = program_category) # we use stratified sampling because categories are imbalanced
+nber_folds
+
+# we use recipes() to fast-track our data pre-processing pipeline:
+nber_rec <-
+  recipe(program_category ~ year + title, data = nber_train) %>%
+  step_tokenize(title) %>%
+  step_tokenfilter(title, max_tokens = 200) %>%
+  step_tfidf(title) %>%
+  step_downsample(program_category)
+
+nber_rec
+
+# we specify our model, storing the info in a new object (which we can later integrate via the workflow() function)
+multi_spec <-
+  multinom_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+multi_spec
+
+nber_wf <- workflow(nber_rec, multi_spec)
+nber_wf
+
+
+# we need to tune the penalty hyperparameter
+nber_grid <- grid_regular(penalty(range = c(-5, 0)), levels = 20)
+nber_grid
+
+# doParallel::registerDoParallel() # you can enable parallel computing to enhance speed
+set.seed(2023)
+nber_rs <-
+  tune_grid(
+    nber_wf,
+    nber_folds,
+    grid = nber_grid
+  )
+
+nber_rs
+
+# How well did the model perform?
+autoplot(nber_rs)
+show_best(nber_rs)
+
+## Model selection ----
+final_penalty <-
+  nber_rs %>%
+  select_by_one_std_err(metric = "roc_auc", desc(penalty))
+
+final_penalty
+
+# apply this optimal model using the last_fit() function
+final_rs <-
+  nber_wf %>%
+  finalize_workflow(final_penalty) %>%
+  last_fit(nber_split)
+
+final_rs
+
+## Evaluate performance on the test (hold-out) sample
+collect_metrics(final_rs)
+
+# visualize this with a more complex multiclass confusion matrix
+collect_predictions(final_rs) %>%
+  conf_mat(program_category, .pred_class) %>%
+  autoplot()
+
+# visualize ROC for each class
+collect_predictions(final_rs) %>%
+  roc_curve(truth = program_category, .pred_Finance:.pred_Micro) %>%
+  ggplot(aes(1 - specificity, sensitivity, color = .level)) +
+  geom_abline(slope = 1, color = "gray50", lty = 2, alpha = 0.8) +
+  geom_path(size = 1.5, alpha = 0.7) +
+  labs(color = NULL) +
+  coord_fixed()
+
+# extract the final model (to save/export/re-use on new data), using the extract_workflow() function
+final_fitted <- extract_workflow(final_rs)
+
+# Now you can play around, making up new titles and seeing how the model predicts them
+predict(final_fitted, tibble(year = 2021, title = "Why is my bank account always empty?"), type = "prob")
